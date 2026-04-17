@@ -1,0 +1,18 @@
+scraper:
+  # Run browser without a visible window
+  headless: true
+  # mdecoder enforces a 20-30s countdown — this is the max seconds to wait
+  # for results to appear after form submission before giving up
+  max_wait_seconds: 120
+  # Random delay between keystrokes in ms — makes typing look human
+  inter_key_delay_ms: [80, 220]
+  # How many different VPN regions to try per VIN before marking it failed
+  max_retries: 8
+
+# "auto"   — rotate VPN region and retry automatically on block/captcha
+# "manual" — pause and prompt you to solve captcha in the browser window
+#            (headless is forced to false in manual mode)
+mode: auto
+
+output_dir: ./output
+db_path: ./state.db

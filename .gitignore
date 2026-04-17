@@ -1,0 +1,6 @@
+*.pyc
+__pycache__/
+state.db
+failed.txt
+output/
+.venv/
