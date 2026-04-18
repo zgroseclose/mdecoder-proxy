@@ -28,6 +28,29 @@ python mdecoder.py --file vins.txt --manual-captcha
 
 Output HTML is written to `results/<VIN>_<UTC-timestamp>_<sessionid>.html`.
 
+## HTTP server mode
+
+For integration with a separate app (e.g. a containerized webapp that can't
+pop a browser itself), run mdecoder-proxy as a local HTTP service:
+
+```bash
+python server.py                    # binds 127.0.0.1:8765, headed + manual captcha
+python server.py --port 9000
+python server.py --headless --no-manual-captcha   # unattended mode
+```
+
+The server exposes:
+
+- `GET  /health` → `{"ok": true}` once the browser is up
+- `POST /decode/{vin}` → `{"status": "ok", "html": "...", "url": "..."}` on
+  success, `{"status": "rate_limited", ...}` if the captcha appears while
+  `--no-manual-captcha` is set, or HTTP 502 with `{"status":
+  "transport_error", ...}` on navigation failure
+
+Browser work is pinned to a single thread, so requests are serialized —
+which matches the manual-captcha UX anyway. The default bind is loopback;
+don't expose this port publicly, it drives a visible browser on the host.
+
 ### Why `--manual-captcha`?
 
 Every residential IP we've tested from floxy immediately triggers mdecoder's
@@ -63,6 +86,7 @@ For each VIN attempt:
 ## Files
 
 - `mdecoder.py` — CLI entry, retry loop, file I/O
+- `server.py` — FastAPI HTTP front-end for integration with other apps
 - `decoder.py` — single-attempt decode via Playwright
 - `proxy.py` — floxy proxy config with rotating session ids
 - `.env.example` — template for floxy credentials
