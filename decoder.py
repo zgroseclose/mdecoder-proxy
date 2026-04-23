@@ -50,6 +50,15 @@ HOLDING_MARKERS = (
     "please refresh",
 )
 
+# mdecoder renders this page when it has no active decode job for the VIN
+# — usually because the original job's TTL expired while the user was
+# solving a captcha. Retrying (fresh form submit from /) creates a new
+# job and often succeeds.
+NOT_FOUND_MARKERS = (
+    "vehicle not found",
+    "vin not found",
+)
+
 # Total time we'll keep the page open waiting for the holding state to clear.
 # The server promises ~30s; allow generous headroom across a few meta-refreshes.
 DECODE_TIMEOUT_SECONDS = 90
@@ -93,6 +102,10 @@ def _classify(html: str, url: str, vin: str) -> str:
     lowered = html.lower()
     if any(m in lowered for m in LIMIT_MARKERS):
         return "captcha"
+    # Check not-found BEFORE "done": the not-found page is on /decode/{vin}/
+    # and contains the VIN string, so it'd false-positive as "done" otherwise.
+    if any(m in lowered for m in NOT_FOUND_MARKERS):
+        return "not_found"
     if any(m in lowered for m in HOLDING_MARKERS):
         return "holding"
     # Positive result signals: on the /decode/ path AND the page mentions
@@ -187,6 +200,7 @@ def _decode_with_browser(
         # a captcha, or we time out.
         deadline = time.monotonic() + DECODE_TIMEOUT_SECONDS
         awaiting_human = False
+        retried_not_found = False
         while True:
             html = _safe_content(page)
             verdict = _classify(html, page.url, vin)
@@ -227,16 +241,43 @@ def _decode_with_browser(
                     status_code=200,
                 )
 
-            elif awaiting_human:
-                # Human solved the captcha. Don't trust the current page —
-                # mdecoder's original decode job was dropped when Cloudflare
-                # intercepted, so /decode/{vin}/ will render "Vehicle not
-                # found, try again later" if we keep polling it. Go back to
-                # / and re-submit the form for a fresh decode job.
+            elif verdict == "not_found":
+                # mdecoder has no active decode job for this VIN. Almost
+                # always because the job's TTL expired during a captcha
+                # wait. Re-submitting the form from / creates a fresh job
+                # — and since Cloudflare just validated this session,
+                # the submission usually goes straight through without
+                # another captcha. Only retry once so we don't loop.
+                if retried_not_found:
+                    log.warning(
+                        "VIN %s still 'not found' after retry — giving up",
+                        vin,
+                    )
+                    return DecodeResult(
+                        vin=vin,
+                        html=html,
+                        url=page.url,
+                        status_code=200,
+                    )
+                retried_not_found = True
                 awaiting_human = False
-                log.info("captcha cleared — re-submitting VIN %s", vin)
+                log.info(
+                    "mdecoder returned 'Vehicle not found' for %s — "
+                    "resubmitting VIN once",
+                    vin,
+                )
                 _submit_vin(page, vin)
                 deadline = time.monotonic() + DECODE_TIMEOUT_SECONDS
+
+            elif awaiting_human:
+                # Captcha cleared. Let the site's own flow play out —
+                # after the user clicks "Solve Captcha", mdecoder typically
+                # navigates to a holding page and then the decode result.
+                # Interrupting with a re-submit here wastes the user's
+                # captcha solve and tends to trigger a second captcha.
+                awaiting_human = False
+                deadline = time.monotonic() + DECODE_TIMEOUT_SECONDS
+                log.info("captcha cleared — waiting for decode to complete")
 
             if time.monotonic() >= deadline:
                 raise TransportError(
