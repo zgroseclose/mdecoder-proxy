@@ -59,6 +59,84 @@ NOT_FOUND_MARKERS = (
     "vin not found",
 )
 
+# Third-party ad / analytics hosts that mdecoder embeds. Blocking these
+# through a Playwright route handler shaves a few seconds off every
+# decode — some of these endpoints are slow through a residential proxy
+# and we don't need the responses for anything. Matched as substrings
+# against the full request URL.
+#
+# CAREFUL: do NOT add google.com or gstatic.com wholesale — Cloudflare's
+# JS challenge and the reCAPTCHA widget load scripts from those origins.
+# We whitelist specific paths (recaptcha) in _block_ads before the host
+# check so the captcha keeps working.
+AD_HOSTS = (
+    "googlesyndication.com",
+    "doubleclick.net",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googletagservices.com",
+    "googleadservices.com",
+    "adservice.google.",
+    "pagead2.googlesyndication",
+    "facebook.net",
+    "facebook.com/tr",
+    "connect.facebook.net",
+    "adnxs.com",
+    "taboola.com",
+    "outbrain.com",
+    "criteo.com",
+    "criteo.net",
+    "scorecardresearch.com",
+    "quantserve.com",
+    "moatads.com",
+    "amazon-adsystem.com",
+    "adsrvr.org",
+    "bing.com/bat",
+    "hotjar.com",
+    "clarity.ms",
+    "segment.io",
+    "mixpanel.com",
+    "pubmatic.com",
+    "rubiconproject.com",
+    "openx.net",
+    "casalemedia.com",
+    "3lift.com",
+    "bidswitch.net",
+    "smartadserver.com",
+    "yieldmo.com",
+    "media.net",
+    "zedo.com",
+    "adform.net",
+)
+
+# Resource types worth killing wholesale. Fonts and <video>/<audio> only
+# slow things down. We deliberately keep "image" because reCAPTCHA's
+# challenge ("select all squares with traffic lights") is image-based —
+# blocking images would break manual captcha solves.
+_BLOCKED_RESOURCE_TYPES = {"media", "font"}
+
+
+def _block_ads(route, request) -> None:
+    """Playwright route handler: abort ad / analytics / heavy-asset requests.
+
+    Runs for every request the page makes. We keep the logic tight since
+    it's on the hot path — early-return on the allow-list, then check
+    host substrings, then resource type.
+    """
+    url = request.url
+    # Allow-list: reCAPTCHA must keep loading or manual solves break.
+    # Cloudflare's JS challenge also lives on these origins.
+    if "recaptcha" in url or "/cdn-cgi/" in url:
+        route.continue_()
+        return
+    if any(host in url for host in AD_HOSTS):
+        route.abort()
+        return
+    if request.resource_type in _BLOCKED_RESOURCE_TYPES:
+        route.abort()
+        return
+    route.continue_()
+
 # Total time we'll keep the page open waiting for the holding state to clear.
 # The server promises ~30s; allow generous headroom across a few meta-refreshes.
 DECODE_TIMEOUT_SECONDS = 90
@@ -189,6 +267,11 @@ def _decode_with_browser(
     manual_captcha: bool,
 ) -> DecodeResult:
     context = browser.new_context(proxy=proxy_cfg.as_playwright())
+    # Block ads / trackers / heavy assets before any page in this context
+    # issues a request. mdecoder embeds a lot of ad JS that stalls under
+    # a residential proxy; killing it early makes decodes noticeably
+    # snappier without affecting the captcha flow.
+    context.route("**/*", _block_ads)
     try:
         page = context.new_page()
         _STEALTH.apply_stealth_sync(page)
