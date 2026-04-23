@@ -152,10 +152,16 @@ def _submit_vin(page, vin: str) -> None:
 
     try:
         page.fill('input[name="vin"]', vin, timeout=15_000)
+        # `no_wait_after=True` is critical: without it, page.click() *also*
+        # waits for any resulting navigation, bounded by the click's own
+        # timeout. That short-circuits the 60s expect_navigation wrapping
+        # it — so under residential-proxy latency (especially right after
+        # a Cloudflare challenge clears) the click times out at 15s even
+        # though the navigation would finish in 20–30s.
         with page.expect_navigation(
             timeout=60_000, wait_until="domcontentloaded",
         ):
-            page.click('button#decode-free', timeout=15_000)
+            page.click('button#decode-free', timeout=15_000, no_wait_after=True)
     except PlaywrightTimeoutError as exc:
         raise TransportError(
             f"form interaction failed: {exc}",
