@@ -132,6 +132,37 @@ def decode_once(
             browser.close()
 
 
+def _submit_vin(page, vin: str) -> None:
+    """Navigate to / and submit the VIN lookup form.
+
+    Used both for the initial submission and to restart the decode after
+    a manual captcha is solved — mdecoder drops the original decode job
+    when Cloudflare challenges the follow-up request, so the post-solve
+    `/decode/{vin}/` page lands on "Vehicle not found, try again later"
+    unless we kick off a fresh form submission.
+    """
+    try:
+        # `domcontentloaded` instead of `load`: load waits for every ad
+        # tracker / analytics bundle and routinely hangs through a
+        # residential proxy. We only need the form to be present.
+        page.goto(BASE_URL + "/", timeout=60_000, wait_until="domcontentloaded")
+        page.wait_for_selector('input[name="vin"]', timeout=30_000)
+    except PlaywrightTimeoutError as exc:
+        raise TransportError(f"goto /: {exc}") from exc
+
+    try:
+        page.fill('input[name="vin"]', vin, timeout=15_000)
+        with page.expect_navigation(
+            timeout=60_000, wait_until="domcontentloaded",
+        ):
+            page.click('button#decode-free', timeout=15_000)
+    except PlaywrightTimeoutError as exc:
+        raise TransportError(
+            f"form interaction failed: {exc}",
+            debug_html=_safe_content(page),
+        ) from exc
+
+
 def _decode_with_browser(
     vin: str,
     proxy_cfg: ProxyConfig,
@@ -142,26 +173,7 @@ def _decode_with_browser(
     try:
         page = context.new_page()
         _STEALTH.apply_stealth_sync(page)
-        try:
-            # `domcontentloaded` instead of `load`: load waits for every ad
-            # tracker / analytics bundle and routinely hangs through a
-            # residential proxy. We only need the form to be present.
-            page.goto(BASE_URL + "/", timeout=60_000, wait_until="domcontentloaded")
-            page.wait_for_selector('input[name="vin"]', timeout=30_000)
-        except PlaywrightTimeoutError as exc:
-            raise TransportError(f"goto /: {exc}") from exc
-
-        try:
-            page.fill('input[name="vin"]', vin, timeout=15_000)
-            with page.expect_navigation(
-                timeout=60_000, wait_until="domcontentloaded",
-            ):
-                page.click('button#decode-free', timeout=15_000)
-        except PlaywrightTimeoutError as exc:
-            raise TransportError(
-                f"form interaction failed: {exc}",
-                debug_html=_safe_content(page),
-            ) from exc
+        _submit_vin(page, vin)
 
         # Chromium will automatically honor the holding page's
         # `<meta http-equiv="refresh" content="15">`. Each refresh is a real
@@ -210,11 +222,15 @@ def _decode_with_browser(
                 )
 
             elif awaiting_human:
-                # Human solved the captcha; we're back to the normal holding
-                # or post-submit flow. Reset the decode deadline.
+                # Human solved the captcha. Don't trust the current page —
+                # mdecoder's original decode job was dropped when Cloudflare
+                # intercepted, so /decode/{vin}/ will render "Vehicle not
+                # found, try again later" if we keep polling it. Go back to
+                # / and re-submit the form for a fresh decode job.
                 awaiting_human = False
+                log.info("captcha cleared — re-submitting VIN %s", vin)
+                _submit_vin(page, vin)
                 deadline = time.monotonic() + DECODE_TIMEOUT_SECONDS
-                log.info("captcha cleared — continuing decode")
 
             if time.monotonic() >= deadline:
                 raise TransportError(
