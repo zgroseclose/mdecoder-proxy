@@ -83,6 +83,13 @@ def _do_decode(vin: str, manual_captcha: bool) -> dict:
             "message": str(exc),
             "html": exc.debug_html or "",
         }
+    except Exception as exc:
+        log.exception("unexpected error decoding VIN %s", vin)
+        return {
+            "status": "transport_error",
+            "message": f"Unexpected error: {exc}",
+            "html": "",
+        }
     return {"status": "ok", "html": result.html, "url": result.url}
 
 
