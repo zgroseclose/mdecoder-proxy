@@ -240,6 +240,8 @@ def _submit_vin(page, vin: str) -> None:
         page.wait_for_selector('input[name="vin"]', timeout=30_000)
     except PlaywrightTimeoutError as exc:
         raise TransportError(f"goto /: {exc}") from exc
+    except Exception as exc:
+        raise TransportError(f"goto /: {exc}") from exc
 
     try:
         page.fill('input[name="vin"]', vin, timeout=15_000)
@@ -258,6 +260,8 @@ def _submit_vin(page, vin: str) -> None:
             f"form interaction failed: {exc}",
             debug_html=_safe_content(page),
         ) from exc
+    except Exception as exc:
+        raise TransportError(f"form interaction failed: {exc}") from exc
 
 
 def _decode_with_browser(
@@ -283,8 +287,9 @@ def _decode_with_browser(
         # a captcha, or we time out.
         deadline = time.monotonic() + DECODE_TIMEOUT_SECONDS
         awaiting_human = False
-        retried_not_found = False
         while True:
+            if page.is_closed():
+                raise TransportError("browser window was closed")
             html = _safe_content(page)
             verdict = _classify(html, page.url, vin)
 
@@ -325,32 +330,13 @@ def _decode_with_browser(
                 )
 
             elif verdict == "not_found":
-                # mdecoder has no active decode job for this VIN. Almost
-                # always because the job's TTL expired during a captcha
-                # wait. Re-submitting the form from / creates a fresh job
-                # — and since Cloudflare just validated this session,
-                # the submission usually goes straight through without
-                # another captcha. Only retry once so we don't loop.
-                if retried_not_found:
-                    log.warning(
-                        "VIN %s still 'not found' after retry — giving up",
-                        vin,
-                    )
-                    return DecodeResult(
-                        vin=vin,
-                        html=html,
-                        url=page.url,
-                        status_code=200,
-                    )
-                retried_not_found = True
-                awaiting_human = False
-                log.info(
-                    "mdecoder returned 'Vehicle not found' for %s — "
-                    "resubmitting VIN once",
-                    vin,
+                log.info("mdecoder returned 'Vehicle not found' for VIN %s", vin)
+                return DecodeResult(
+                    vin=vin,
+                    html=html,
+                    url=page.url,
+                    status_code=200,
                 )
-                _submit_vin(page, vin)
-                deadline = time.monotonic() + DECODE_TIMEOUT_SECONDS
 
             elif awaiting_human:
                 # Captcha cleared. Let the site's own flow play out —
