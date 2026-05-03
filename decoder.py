@@ -287,6 +287,8 @@ def _decode_with_browser(
         # a captcha, or we time out.
         deadline = time.monotonic() + DECODE_TIMEOUT_SECONDS
         awaiting_human = False
+        captcha_was_solved = False
+        post_captcha_resubmitted = False
         while True:
             if page.is_closed():
                 raise TransportError("browser window was closed")
@@ -330,13 +332,28 @@ def _decode_with_browser(
                 )
 
             elif verdict == "not_found":
-                log.info("mdecoder returned 'Vehicle not found' for VIN %s", vin)
-                return DecodeResult(
-                    vin=vin,
-                    html=html,
-                    url=page.url,
-                    status_code=200,
-                )
+                # After a captcha solve, mdecoder's decode job TTL often
+                # expires while the user is on the challenge page. Re-submit
+                # once to start a fresh job — the Cloudflare session is still
+                # valid so it usually goes straight through. Only do this once,
+                # and only when a captcha was actually solved this session.
+                if captcha_was_solved and not post_captcha_resubmitted:
+                    post_captcha_resubmitted = True
+                    log.info(
+                        "VIN %s not found after captcha solve (job TTL likely "
+                        "expired) — resubmitting once",
+                        vin,
+                    )
+                    _submit_vin(page, vin)
+                    deadline = time.monotonic() + DECODE_TIMEOUT_SECONDS
+                else:
+                    log.info("mdecoder returned 'Vehicle not found' for VIN %s", vin)
+                    return DecodeResult(
+                        vin=vin,
+                        html=html,
+                        url=page.url,
+                        status_code=200,
+                    )
 
             elif awaiting_human:
                 # Captcha cleared. Let the site's own flow play out —
@@ -345,6 +362,7 @@ def _decode_with_browser(
                 # Interrupting with a re-submit here wastes the user's
                 # captcha solve and tends to trigger a second captcha.
                 awaiting_human = False
+                captcha_was_solved = True
                 deadline = time.monotonic() + DECODE_TIMEOUT_SECONDS
                 log.info("captcha cleared — waiting for decode to complete")
 
