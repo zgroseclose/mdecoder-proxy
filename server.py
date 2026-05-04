@@ -79,7 +79,7 @@ def _do_decode(vin: str, manual_captcha: bool, proxy_retries: int) -> dict:
         cfg = new_proxy_config()
         log.info("VIN %s auto-attempt %d/%d session=%s", vin, attempt, proxy_retries, cfg.session_id)
         try:
-            result = decode_once(vin, cfg, browser=_headless_browser, manual_captcha=False)
+            result = decode_once(vin, cfg, browser=_headless_browser, manual_captcha=False, nav_timeout=15_000)
             return {"status": "ok", "html": result.html, "url": result.url}
         except RateLimited:
             log.info("VIN %s attempt %d: captcha — trying next proxy", vin, attempt)

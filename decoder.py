@@ -201,6 +201,7 @@ def decode_once(
     browser: Browser | None = None,
     headless: bool = True,
     manual_captcha: bool = False,
+    nav_timeout: int = 60_000,
 ) -> DecodeResult:
     """Run one decode attempt through the given proxy.
 
@@ -213,17 +214,17 @@ def decode_once(
     a browser is launched and closed inside this call.
     """
     if browser is not None:
-        return _decode_with_browser(vin, proxy_cfg, browser, manual_captcha)
+        return _decode_with_browser(vin, proxy_cfg, browser, manual_captcha, nav_timeout=nav_timeout)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless)
         try:
-            return _decode_with_browser(vin, proxy_cfg, browser, manual_captcha)
+            return _decode_with_browser(vin, proxy_cfg, browser, manual_captcha, nav_timeout=nav_timeout)
         finally:
             browser.close()
 
 
-def _submit_vin(page, vin: str) -> None:
+def _submit_vin(page, vin: str, *, nav_timeout: int = 60_000, selector_timeout: int = 30_000) -> None:
     """Navigate to / and submit the VIN lookup form.
 
     Used both for the initial submission and to restart the decode after
@@ -231,30 +232,33 @@ def _submit_vin(page, vin: str) -> None:
     when Cloudflare challenges the follow-up request, so the post-solve
     `/decode/{vin}/` page lands on "Vehicle not found, try again later"
     unless we kick off a fresh form submission.
+
+    nav_timeout / selector_timeout can be shortened for headless probe
+    attempts so a slow/blocked IP fails fast instead of hanging for 60s.
     """
     try:
         # `domcontentloaded` instead of `load`: load waits for every ad
         # tracker / analytics bundle and routinely hangs through a
         # residential proxy. We only need the form to be present.
-        page.goto(BASE_URL + "/", timeout=60_000, wait_until="domcontentloaded")
-        page.wait_for_selector('input[name="vin"]', timeout=30_000)
+        page.goto(BASE_URL + "/", timeout=nav_timeout, wait_until="domcontentloaded")
+        page.wait_for_selector('input[name="vin"]', timeout=selector_timeout)
     except PlaywrightTimeoutError as exc:
         raise TransportError(f"goto /: {exc}") from exc
     except Exception as exc:
         raise TransportError(f"goto /: {exc}") from exc
 
     try:
-        page.fill('input[name="vin"]', vin, timeout=15_000)
+        page.fill('input[name="vin"]', vin, timeout=selector_timeout)
         # `no_wait_after=True` is critical: without it, page.click() *also*
         # waits for any resulting navigation, bounded by the click's own
-        # timeout. That short-circuits the 60s expect_navigation wrapping
-        # it — so under residential-proxy latency (especially right after
-        # a Cloudflare challenge clears) the click times out at 15s even
-        # though the navigation would finish in 20–30s.
+        # timeout. That short-circuits the nav_timeout wrapping it — so
+        # under residential-proxy latency (especially right after a
+        # Cloudflare challenge clears) the click times out at the fill
+        # timeout even though the navigation would finish in 20–30s.
         with page.expect_navigation(
-            timeout=60_000, wait_until="domcontentloaded",
+            timeout=nav_timeout, wait_until="domcontentloaded",
         ):
-            page.click('button#decode-free', timeout=15_000, no_wait_after=True)
+            page.click('button#decode-free', timeout=selector_timeout, no_wait_after=True)
     except PlaywrightTimeoutError as exc:
         raise TransportError(
             f"form interaction failed: {exc}",
@@ -269,6 +273,8 @@ def _decode_with_browser(
     proxy_cfg: ProxyConfig,
     browser: Browser,
     manual_captcha: bool,
+    *,
+    nav_timeout: int = 60_000,
 ) -> DecodeResult:
     context = browser.new_context(proxy=proxy_cfg.as_playwright())
     # Block ads / trackers / heavy assets before any page in this context
@@ -276,10 +282,11 @@ def _decode_with_browser(
     # a residential proxy; killing it early makes decodes noticeably
     # snappier without affecting the captcha flow.
     context.route("**/*", _block_ads)
+    selector_timeout = min(nav_timeout, 15_000)
     try:
         page = context.new_page()
         _STEALTH.apply_stealth_sync(page)
-        _submit_vin(page, vin)
+        _submit_vin(page, vin, nav_timeout=nav_timeout, selector_timeout=selector_timeout)
 
         # Chromium will automatically honor the holding page's
         # `<meta http-equiv="refresh" content="15">`. Each refresh is a real
@@ -296,7 +303,11 @@ def _decode_with_browser(
             verdict = _classify(html, page.url, vin)
 
             if verdict == "captcha":
-                if not manual_captcha:
+                if not manual_captcha or post_captcha_resubmitted:
+                    # Either manual captcha is off, or we already solved one
+                    # captcha and the resubmit got challenged again — give up
+                    # so the VIN gets queued rather than blocking on a second
+                    # manual solve.
                     raise RateLimited(
                         f"captcha/limit page for VIN {vin}",
                         debug_html=html,
@@ -344,7 +355,7 @@ def _decode_with_browser(
                         "expired) — resubmitting once",
                         vin,
                     )
-                    _submit_vin(page, vin)
+                    _submit_vin(page, vin, nav_timeout=nav_timeout, selector_timeout=selector_timeout)
                     deadline = time.monotonic() + DECODE_TIMEOUT_SECONDS
                 else:
                     log.info("mdecoder returned 'Vehicle not found' for VIN %s", vin)
