@@ -63,34 +63,50 @@ def _stop_browser() -> None:
         _pw = None
 
 
-def _do_decode(vin: str, manual_captcha: bool) -> dict:
+def _do_decode(vin: str, manual_captcha: bool, proxy_retries: int) -> dict:
     assert _browser is not None, "browser not initialized"
-    cfg = new_proxy_config()
-    log.info("decoding VIN %s session=%s", vin, cfg.session_id)
-    try:
-        result = decode_once(
-            vin, cfg, browser=_browser, manual_captcha=manual_captcha,
-        )
-    except RateLimited as exc:
+
+    # Try up to proxy_retries different residential IPs without blocking on
+    # captcha. Each attempt gets a fresh Floxy session (new exit IP). On
+    # captcha we move on immediately; on transport errors we give up early
+    # since those tend to be network issues that affect all IPs equally.
+    for attempt in range(1, proxy_retries + 1):
+        cfg = new_proxy_config()
+        log.info("VIN %s auto-attempt %d/%d session=%s", vin, attempt, proxy_retries, cfg.session_id)
+        try:
+            result = decode_once(vin, cfg, browser=_browser, manual_captcha=False)
+            return {"status": "ok", "html": result.html, "url": result.url}
+        except RateLimited:
+            log.info("VIN %s attempt %d got captcha — trying next proxy", vin, attempt)
+        except TransportError as exc:
+            return {"status": "transport_error", "message": str(exc), "html": exc.debug_html or ""}
+        except Exception as exc:
+            log.exception("unexpected error on attempt %d for VIN %s", attempt, vin)
+            return {"status": "transport_error", "message": f"Unexpected error: {exc}", "html": ""}
+
+    if not manual_captcha:
         return {
             "status": "rate_limited",
-            "message": str(exc),
-            "html": exc.debug_html or "",
-        }
-    except TransportError as exc:
-        return {
-            "status": "transport_error",
-            "message": str(exc),
-            "html": exc.debug_html or "",
-        }
-    except Exception as exc:
-        log.exception("unexpected error decoding VIN %s", vin)
-        return {
-            "status": "transport_error",
-            "message": f"Unexpected error: {exc}",
+            "message": f"captcha on all {proxy_retries} proxy attempts for VIN {vin}",
             "html": "",
         }
-    return {"status": "ok", "html": result.html, "url": result.url}
+
+    # All auto retries hit captcha — try once more with manual captcha fallback.
+    cfg = new_proxy_config()
+    log.warning(
+        "VIN %s: all %d auto attempts got captcha — waiting for manual captcha solve",
+        vin, proxy_retries,
+    )
+    try:
+        result = decode_once(vin, cfg, browser=_browser, manual_captcha=True)
+        return {"status": "ok", "html": result.html, "url": result.url}
+    except RateLimited as exc:
+        return {"status": "rate_limited", "message": str(exc), "html": exc.debug_html or ""}
+    except TransportError as exc:
+        return {"status": "transport_error", "message": str(exc), "html": exc.debug_html or ""}
+    except Exception as exc:
+        log.exception("unexpected error in manual captcha attempt for VIN %s", vin)
+        return {"status": "transport_error", "message": f"Unexpected error: {exc}", "html": ""}
 
 
 class DecodeResponse(BaseModel):
@@ -100,7 +116,7 @@ class DecodeResponse(BaseModel):
     message: str | None = None
 
 
-def create_app(*, headless: bool, manual_captcha: bool) -> FastAPI:
+def create_app(*, headless: bool, manual_captcha: bool, proxy_retries: int) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Initialize the browser on the executor thread so sync_playwright
@@ -123,7 +139,7 @@ def create_app(*, headless: bool, manual_captcha: bool) -> FastAPI:
         vin = vin.strip().upper()
         if len(vin) != 17:
             raise HTTPException(400, f"invalid VIN length: {vin!r}")
-        result = await _run_on_executor(lambda: _do_decode(vin, manual_captcha))
+        result = await _run_on_executor(lambda: _do_decode(vin, manual_captcha, proxy_retries))
         if result["status"] == "transport_error":
             return JSONResponse(status_code=502, content=result)
         return result
@@ -160,6 +176,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Treat captcha pages as rate-limited instead of waiting for a human.",
     )
+    parser.add_argument(
+        "--proxy-retries",
+        type=int,
+        default=int(os.environ.get("MDECODER_PROXY_RETRIES", "0")),
+        help="Number of fresh proxy IPs to try automatically before falling back "
+             "to manual captcha (default: 0 — go straight to manual captcha).",
+    )
     args = parser.parse_args(argv)
 
     load_dotenv()
@@ -171,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     app = create_app(
         headless=args.headless,
         manual_captcha=not args.no_manual_captcha,
+        proxy_retries=args.proxy_retries,
     )
     # Bind host is configurable but the default is loopback — this server
     # launches a visible browser on the machine it runs on and should not be
