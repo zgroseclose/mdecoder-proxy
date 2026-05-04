@@ -277,11 +277,6 @@ def _decode_with_browser(
     nav_timeout: int = 60_000,
 ) -> DecodeResult:
     context = browser.new_context(proxy=proxy_cfg.as_playwright())
-    # Block ads / trackers / heavy assets before any page in this context
-    # issues a request. mdecoder embeds a lot of ad JS that stalls under
-    # a residential proxy; killing it early makes decodes noticeably
-    # snappier without affecting the captcha flow.
-    context.route("**/*", _block_ads)
     selector_timeout = min(nav_timeout, 15_000)
     try:
         page = context.new_page()
