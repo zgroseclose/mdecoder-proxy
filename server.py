@@ -37,24 +37,28 @@ log = logging.getLogger("mdecoder.server")
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mdecoder-pw")
 
 _pw = None
-_browser: Browser | None = None
+_headless_browser: Browser | None = None  # used for auto-retry attempts
+_browser: Browser | None = None           # headful, used for manual captcha
 
 
 def _start_browser(headless: bool) -> None:
-    global _pw, _browser
+    global _pw, _headless_browser, _browser
     _pw = sync_playwright().start()
+    _headless_browser = _pw.chromium.launch(headless=True)
     _browser = _pw.chromium.launch(headless=headless)
-    log.info("browser started (headless=%s)", headless)
+    log.info("browsers started (auto-retry: headless, manual-captcha: headless=%s)", headless)
 
 
 def _stop_browser() -> None:
-    global _pw, _browser
-    if _browser is not None:
-        try:
-            _browser.close()
-        except Exception:
-            pass
-        _browser = None
+    global _pw, _headless_browser, _browser
+    for b in (_headless_browser, _browser):
+        if b is not None:
+            try:
+                b.close()
+            except Exception:
+                pass
+    _headless_browser = None
+    _browser = None
     if _pw is not None:
         try:
             _pw.stop()
@@ -64,22 +68,25 @@ def _stop_browser() -> None:
 
 
 def _do_decode(vin: str, manual_captcha: bool, proxy_retries: int) -> dict:
-    assert _browser is not None, "browser not initialized"
+    assert _headless_browser is not None, "browser not initialized"
 
     # Try up to proxy_retries different residential IPs without blocking on
-    # captcha. Each attempt gets a fresh Floxy session (new exit IP). On
-    # captcha we move on immediately; on transport errors we give up early
-    # since those tend to be network issues that affect all IPs equally.
+    # captcha. Each attempt gets a fresh Floxy session (new exit IP) and runs
+    # headless so no windows flash open. Retry on both captcha and transport
+    # errors (e.g. ERR_TUNNEL_CONNECTION_FAILED) since those are per-IP —
+    # only short-circuit on user abort or unexpected exceptions.
     for attempt in range(1, proxy_retries + 1):
         cfg = new_proxy_config()
         log.info("VIN %s auto-attempt %d/%d session=%s", vin, attempt, proxy_retries, cfg.session_id)
         try:
-            result = decode_once(vin, cfg, browser=_browser, manual_captcha=False)
+            result = decode_once(vin, cfg, browser=_headless_browser, manual_captcha=False)
             return {"status": "ok", "html": result.html, "url": result.url}
         except RateLimited:
-            log.info("VIN %s attempt %d got captcha — trying next proxy", vin, attempt)
+            log.info("VIN %s attempt %d: captcha — trying next proxy", vin, attempt)
         except TransportError as exc:
-            return {"status": "transport_error", "message": str(exc), "html": exc.debug_html or ""}
+            if "browser window was closed" in str(exc):
+                return {"status": "transport_error", "message": str(exc), "html": ""}
+            log.info("VIN %s attempt %d: transport error — trying next proxy: %s", vin, attempt, exc)
         except Exception as exc:
             log.exception("unexpected error on attempt %d for VIN %s", attempt, vin)
             return {"status": "transport_error", "message": f"Unexpected error: {exc}", "html": ""}
@@ -132,7 +139,7 @@ def create_app(*, headless: bool, manual_captcha: bool, proxy_retries: int) -> F
 
     @app.get("/health")
     async def health():
-        return {"ok": _browser is not None}
+        return {"ok": _headless_browser is not None}
 
     @app.post("/decode/{vin}", response_model=DecodeResponse)
     async def decode(vin: str):
